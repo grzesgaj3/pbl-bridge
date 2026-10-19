@@ -1,0 +1,25 @@
+[project]
+name = "pbl-uart-bridge"
+version = "0.1.0"
+description = "UART <-> pbl-api bridge for Raspberry Pi"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial>=3.5",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
