@@ -216,14 +216,6 @@ def load_config() -> Config:
     )
 
 
-def setup_logging(level_name: str) -> None:
-    level = getattr(logging, level_name.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-
 def uart_reader(
     ser: serial.Serial,
     serial_lock: threading.Lock,
@@ -239,18 +231,15 @@ def uart_reader(
             log.error("serial read error: %s", exc)
             time.sleep(2)
             continue
-        if not raw:
-            continue
-        try:
-            line = raw.decode("utf-8", errors="replace").strip()
-        except UnicodeDecodeError:
-            continue
+
+        line = raw.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         entry = parse_measurement_line(line)
         if entry is None:
             log.warning("invalid measurement line ignored: %r", line)
             continue
+
         result = api.post_measurement(entry["sensor_id"], entry["value_mm"], entry["sent_at"])
         if result.ok:
             log.info(
@@ -259,8 +248,7 @@ def uart_reader(
                 entry["value_mm"],
                 entry["sent_at"],
             )
-            continue
-        if result.retryable:
+        elif result.retryable:
             log.warning("API unavailable, queued: %s (%s)", entry, result.detail)
             queue.append(entry)
         else:
@@ -281,8 +269,7 @@ def flush_measurements(api: ApiClient, queue: MeasurementQueue) -> None:
         )
         if result.ok:
             sent += 1
-            continue
-        if result.retryable:
+        elif result.retryable:
             remaining.append(entry)
         else:
             log.error("dropping queued measurement (permanent): %s (%s)", entry, result.detail)
@@ -296,12 +283,14 @@ def flush_pending_acks(api: ApiClient, pending: PendingAcks) -> None:
     ids = pending.load()
     if not ids:
         return
-    remaining: list[int] = []
+    remaining = []
     for cid in ids:
         result = api.ack_command(cid)
-        if not result.ok and result.retryable:
+        if result.ok:
+            continue
+        if result.retryable:
             remaining.append(cid)
-        elif not result.ok:
+        else:
             log.error("dropping pending ack %s (%s)", cid, result.detail)
     if remaining != ids:
         pending.save(remaining)
@@ -313,10 +302,7 @@ def process_commands(
     serial_lock: threading.Lock,
     pending: PendingAcks,
 ) -> None:
-    commands = api.get_pending_commands()
-    if not commands:
-        return
-    for cmd in commands:
+    for cmd in api.get_pending_commands():
         cid = cmd.get("id")
         if not isinstance(cid, int):
             continue
@@ -347,7 +333,10 @@ def process_commands(
 
 def main() -> None:
     config = load_config()
-    setup_logging(os.getenv("LOG_LEVEL", "info"))
+    logging.basicConfig(
+        level=getattr(logging, os.getenv("LOG_LEVEL", "info").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     log.info(
         "starting uart-bridge: port=%s baud=%s interval=%ss",
         config.serial_port,
