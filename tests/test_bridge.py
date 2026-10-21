@@ -12,7 +12,15 @@ from bridge import (
 
 
 def test_parse_valid_line():
-    assert parse_measurement_line("sensor1;20;123456789") == {
+    assert parse_measurement_line("sensor1: 20;123456789;") == {
+        "sensor_id": "sensor1",
+        "value_mm": 20.0,
+        "sent_at": 123456789,
+    }
+
+
+def test_parse_accepts_line_without_trailing_semicolon():
+    assert parse_measurement_line("sensor1: 20;123456789") == {
         "sensor_id": "sensor1",
         "value_mm": 20.0,
         "sent_at": 123456789,
@@ -20,36 +28,48 @@ def test_parse_valid_line():
 
 
 def test_parse_trims_fields():
-    assert parse_measurement_line("  sensor1 ; 3.4 ; 1729260000  ") == {
+    assert parse_measurement_line("  sensor1 : 3.4 ; 1729260000  ") == {
         "sensor_id": "sensor1",
         "value_mm": 3.4,
         "sent_at": 1729260000,
     }
 
 
+def test_parse_allows_spaces_in_sensor_name():
+    assert parse_measurement_line("sensor one: 2;1;") == {
+        "sensor_id": "sensor one",
+        "value_mm": 2.0,
+        "sent_at": 1,
+    }
+
+
+def test_parse_rejects_old_semicolon_format():
+    assert parse_measurement_line("sensor1;20;123456789") is None
+
+
 def test_parse_rejects_wrong_field_count():
-    assert parse_measurement_line("sensor1;20") is None
-    assert parse_measurement_line("a;b;c;d") is None
+    assert parse_measurement_line("sensor1: 20") is None
+    assert parse_measurement_line("sensor1: a;b;c") is None
 
 
 def test_parse_rejects_empty_sensor():
-    assert parse_measurement_line(";20;1") is None
+    assert parse_measurement_line(": 20;1") is None
 
 
 def test_parse_rejects_too_long_sensor():
-    assert parse_measurement_line("x" * 65 + ";1;1") is None
+    assert parse_measurement_line("x" * 65 + ": 1;1") is None
 
 
 def test_parse_rejects_bad_value():
-    assert parse_measurement_line("s;abc;1") is None
-    assert parse_measurement_line("s;-1;1") is None
-    assert parse_measurement_line("s;10000;1") is None
-    assert parse_measurement_line("s;1.234;1") is None
+    assert parse_measurement_line("s: abc;1") is None
+    assert parse_measurement_line("s: -1;1") is None
+    assert parse_measurement_line("s: 10000;1") is None
+    assert parse_measurement_line("s: 1.234;1") is None
 
 
 def test_parse_rejects_bad_epoch():
-    assert parse_measurement_line("s;1;abc") is None
-    assert parse_measurement_line("s;1;-5") is None
+    assert parse_measurement_line("s: 1;abc") is None
+    assert parse_measurement_line("s: 1;-5") is None
 
 
 def test_measurement_queue_roundtrip(tmp_path: Path):

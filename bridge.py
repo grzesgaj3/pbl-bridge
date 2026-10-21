@@ -185,23 +185,26 @@ class PendingAcks:
 
 
 def parse_measurement_line(line: str) -> dict[str, Any] | None:
-    """Parse 'sensor;value_mm;epoch'. Return None on any validation failure."""
-    parts = [p.strip() for p in line.strip().split(";")]
-    if len(parts) != 3:
+    """Parse 'sensor: value_mm;epoch[;]'. Return None on any validation failure."""
+    sensor_id, sep, rest = line.partition(":")
+    sensor_id = sensor_id.strip()
+    if not sep or not sensor_id or len(sensor_id) > 64:
         return None
-    sensor_id, value_str, epoch_str = parts
-    if not sensor_id or len(sensor_id) > 64:
+
+    parts = [p.strip() for p in rest.strip().rstrip(";").split(";")]
+    if len(parts) != 2:
         return None
+    value_str, epoch_str = parts
+
     try:
         value = float(value_str)
     except ValueError:
         return None
     if value < 0 or value > 9999.99:
         return None
-    if "." in value_str:
-        decimals = value_str.split(".", 1)[1]
-        if len(decimals) > 2:
-            return None
+    if "." in value_str and len(value_str.split(".", 1)[1]) > 2:
+        return None
+
     try:
         sent_at = int(epoch_str)
     except ValueError:

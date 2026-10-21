@@ -47,11 +47,12 @@ Stop with Ctrl+C. Logs go to stdout.
 Input (one line per reading):
 
 ```
-sensor1;20;123456789
+sensor1: 20;123456789;
 ```
 
-`sensor_id;value_mm (0..9999.99);epoch_seconds`. Invalid lines are logged and
-ignored.
+`sensor_id: value_mm (0..9999.99);epoch_seconds;` — the final semicolon is
+optional. Invalid lines, including the old `sensor;value;epoch` format, are
+logged and ignored.
 
 Output (cleaning command, sent by the API's payload):
 
