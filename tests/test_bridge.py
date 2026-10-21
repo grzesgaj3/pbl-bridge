@@ -1,12 +1,14 @@
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 import requests
 
 from bridge import (
     ApiClient,
     MeasurementQueue,
     PendingAcks,
+    load_config,
     parse_measurement_line,
 )
 
@@ -99,6 +101,42 @@ def test_pending_acks_handles_corrupt(tmp_path: Path):
     path = tmp_path / "acks.json"
     path.write_text("garbage", encoding="utf-8")
     assert PendingAcks(path).load() == []
+
+
+def test_load_config_requires_api_url(monkeypatch):
+    monkeypatch.delenv("API_URL", raising=False)
+    monkeypatch.setenv("API_KEY", "key")
+    with pytest.raises(SystemExit):
+        load_config()
+
+
+def test_load_config_defaults(monkeypatch):
+    monkeypatch.setenv("API_URL", "http://example.test")
+    monkeypatch.setenv("API_KEY", "key")
+    for name in (
+        "SERIAL_PORT",
+        "SERIAL_BAUD",
+        "POLL_INTERVAL_SEC",
+        "MEASUREMENTS_QUEUE_FILE",
+        "PENDING_ACKS_FILE",
+        "HTTP_TIMEOUT_SEC",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    config = load_config()
+    assert config.serial_port == "/dev/serial0"
+    assert config.serial_baud == 9600
+    assert config.poll_interval == 30.0
+    assert config.measurements_queue == Path("measurements_queue.jsonl")
+    assert config.pending_acks == Path("pending_acks.json")
+    assert config.http_timeout == 10.0
+
+
+def test_load_config_rejects_invalid_interval(monkeypatch):
+    monkeypatch.setenv("API_URL", "http://example.test")
+    monkeypatch.setenv("API_KEY", "key")
+    monkeypatch.setenv("POLL_INTERVAL_SEC", "0")
+    with pytest.raises(SystemExit):
+        load_config()
 
 
 def _make_client() -> ApiClient:

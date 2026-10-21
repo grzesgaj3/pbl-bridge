@@ -214,47 +214,32 @@ def parse_measurement_line(line: str) -> dict[str, Any] | None:
     return {"sensor_id": sensor_id, "value_mm": value, "sent_at": sent_at}
 
 
-def load_config() -> Config:
-    def req(name: str) -> str:
-        value = os.getenv(name, "").strip()
-        if not value:
+def env(name: str, default: str | None = None, cast=str):
+    raw = os.getenv(name, default)
+    if raw is None or not raw.strip():
+        if default is None:
             raise SystemExit(f"Missing required environment variable: {name}")
-        return value
+        raw = default
+    try:
+        return cast(raw.strip())
+    except ValueError as exc:
+        raise SystemExit(f"Invalid {name}: {raw}") from exc
 
-    api_url = req("API_URL")
-    api_key = req("API_KEY")
-    serial_port = os.getenv("SERIAL_PORT", "/dev/serial0").strip()
-    baud_raw = os.getenv("SERIAL_BAUD", "9600").strip()
-    try:
-        serial_baud = int(baud_raw)
-    except ValueError as exc:
-        raise SystemExit(f"Invalid SERIAL_BAUD: {baud_raw}") from exc
-    interval_raw = os.getenv("POLL_INTERVAL_SEC", "30").strip()
-    try:
-        poll_interval = float(interval_raw)
-    except ValueError as exc:
-        raise SystemExit(f"Invalid POLL_INTERVAL_SEC: {interval_raw}") from exc
+
+def load_config() -> Config:
+    poll_interval = env("POLL_INTERVAL_SEC", "30", float)
     if poll_interval <= 0:
         raise SystemExit("POLL_INTERVAL_SEC must be > 0")
-    measurements_queue = Path(
-        os.getenv("MEASUREMENTS_QUEUE_FILE", "measurements_queue.jsonl").strip()
-    )
-    pending_acks = Path(os.getenv("PENDING_ACKS_FILE", "pending_acks.json").strip())
-    http_timeout_raw = os.getenv("HTTP_TIMEOUT_SEC", "10").strip()
-    try:
-        http_timeout = float(http_timeout_raw)
-    except ValueError as exc:
-        raise SystemExit(f"Invalid HTTP_TIMEOUT_SEC: {http_timeout_raw}") from exc
 
     return Config(
-        api_url=api_url,
-        api_key=api_key,
-        serial_port=serial_port,
-        serial_baud=serial_baud,
+        api_url=env("API_URL"),
+        api_key=env("API_KEY"),
+        serial_port=env("SERIAL_PORT", "/dev/serial0"),
+        serial_baud=env("SERIAL_BAUD", "9600", int),
         poll_interval=poll_interval,
-        measurements_queue=measurements_queue,
-        pending_acks=pending_acks,
-        http_timeout=http_timeout,
+        measurements_queue=Path(env("MEASUREMENTS_QUEUE_FILE", "measurements_queue.jsonl")),
+        pending_acks=Path(env("PENDING_ACKS_FILE", "pending_acks.json")),
+        http_timeout=env("HTTP_TIMEOUT_SEC", "10", float),
     )
 
 
