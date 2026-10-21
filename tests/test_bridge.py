@@ -6,10 +6,12 @@ import requests
 
 from bridge import (
     ApiClient,
-    MeasurementQueue,
-    PendingAcks,
+    append_measurement,
+    load_acks,
     load_config,
     parse_measurement_line,
+    pop_measurements,
+    save_acks,
 )
 
 
@@ -75,32 +77,31 @@ def test_parse_rejects_bad_epoch():
 
 
 def test_measurement_queue_roundtrip(tmp_path: Path):
-    q = MeasurementQueue(tmp_path / "q.jsonl")
-    assert q.pop_all() == []
-    q.append({"sensor_id": "s", "value_mm": 1.0, "sent_at": 10})
-    assert q.pop_all() == [{"sensor_id": "s", "value_mm": 1.0, "sent_at": 10}]
-    assert q.pop_all() == []
+    path = tmp_path / "q.jsonl"
+    assert pop_measurements(path) == []
+    append_measurement(path, {"sensor_id": "s", "value_mm": 1.0, "sent_at": 10})
+    assert pop_measurements(path) == [{"sensor_id": "s", "value_mm": 1.0, "sent_at": 10}]
+    assert pop_measurements(path) == []
 
 
 def test_measurement_queue_skips_corrupt_lines(tmp_path: Path):
     path = tmp_path / "q.jsonl"
     path.write_text('{"a":1}\nnot json\n{"b":2}\n', encoding="utf-8")
-    q = MeasurementQueue(path)
-    assert q.pop_all() == [{"a": 1}, {"b": 2}]
+    assert pop_measurements(path) == [{"a": 1}, {"b": 2}]
     assert path.read_text(encoding="utf-8") == ""
 
 
 def test_pending_acks_roundtrip(tmp_path: Path):
-    p = PendingAcks(tmp_path / "acks.json")
-    assert p.load() == []
-    p.save([3, 1, 3])
-    assert p.load() == [1, 3]
+    path = tmp_path / "acks.json"
+    assert load_acks(path) == []
+    save_acks(path, [3, 1, 3])
+    assert load_acks(path) == [1, 3]
 
 
 def test_pending_acks_handles_corrupt(tmp_path: Path):
     path = tmp_path / "acks.json"
     path.write_text("garbage", encoding="utf-8")
-    assert PendingAcks(path).load() == []
+    assert load_acks(path) == []
 
 
 def test_load_config_requires_api_url(monkeypatch):
