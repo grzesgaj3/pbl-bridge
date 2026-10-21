@@ -116,42 +116,23 @@ class MeasurementQueue:
         with self._lock, self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
 
-    def load(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return self._read_unlocked()
-
-    def _read_unlocked(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        out: list[dict[str, Any]] = []
-        with self.path.open(encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(obj, dict):
-                    out.append(obj)
-        return out
-
     def pop_all(self) -> list[dict[str, Any]]:
         """Atomically read and truncate the queue (used by the flush loop)."""
         with self._lock:
-            entries = self._read_unlocked()
-            with self.path.open("w", encoding="utf-8"):
-                pass
-            return entries
+            if not self.path.exists():
+                return []
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+            self.path.write_text("", encoding="utf-8")
 
-    def save(self, entries: list[dict[str, Any]]) -> None:
-        with self._lock:
-            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            with tmp.open("w", encoding="utf-8") as fh:
-                for entry in entries:
-                    fh.write(json.dumps(entry) + "\n")
-            tmp.replace(self.path)
+        entries: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+        return entries
 
 
 class PendingAcks:
@@ -161,15 +142,13 @@ class PendingAcks:
 
     def load(self) -> list[int]:
         with self._lock:
-            if not self.path.exists():
-                return []
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+            except (OSError, json.JSONDecodeError):
                 return []
-            if not isinstance(data, list):
-                return []
-            return [int(x) for x in data if isinstance(x, int) or str(x).isdigit()]
+        if not isinstance(data, list):
+            return []
+        return [int(x) for x in data if isinstance(x, int) or str(x).isdigit()]
 
     def save(self, ids: list[int]) -> None:
         with self._lock:

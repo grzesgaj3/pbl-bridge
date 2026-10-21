@@ -76,18 +76,18 @@ def test_parse_rejects_bad_epoch():
 
 def test_measurement_queue_roundtrip(tmp_path: Path):
     q = MeasurementQueue(tmp_path / "q.jsonl")
-    assert q.load() == []
+    assert q.pop_all() == []
     q.append({"sensor_id": "s", "value_mm": 1.0, "sent_at": 10})
-    assert q.load() == [{"sensor_id": "s", "value_mm": 1.0, "sent_at": 10}]
-    q.save([{"sensor_id": "s2", "value_mm": 2.0, "sent_at": 20}])
-    assert q.load() == [{"sensor_id": "s2", "value_mm": 2.0, "sent_at": 20}]
+    assert q.pop_all() == [{"sensor_id": "s", "value_mm": 1.0, "sent_at": 10}]
+    assert q.pop_all() == []
 
 
 def test_measurement_queue_skips_corrupt_lines(tmp_path: Path):
     path = tmp_path / "q.jsonl"
     path.write_text('{"a":1}\nnot json\n{"b":2}\n', encoding="utf-8")
     q = MeasurementQueue(path)
-    assert q.load() == [{"a": 1}, {"b": 2}]
+    assert q.pop_all() == [{"a": 1}, {"b": 2}]
+    assert path.read_text(encoding="utf-8") == ""
 
 
 def test_pending_acks_roundtrip(tmp_path: Path):
