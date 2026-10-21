@@ -11,7 +11,9 @@ Configuration is read from environment variables (or a .env file).
 import contextlib
 import json
 import logging
+import math
 import os
+import re
 import signal
 import threading
 import time
@@ -28,6 +30,8 @@ load_dotenv()
 
 log = logging.getLogger("uart-bridge")
 storage_lock = threading.Lock()
+VALUE_RE = re.compile(r"\d+(?:\.\d{1,2})?")
+EPOCH_RE = re.compile(r"\d+")
 
 
 @dataclass(frozen=True)
@@ -149,16 +153,12 @@ def parse_measurement_line(line: str) -> dict[str, Any] | None:
         return None
     value_str, epoch_str = parts
 
-    try:
-        value = float(value_str)
-        sent_at = int(epoch_str)
-    except ValueError:
+    if not VALUE_RE.fullmatch(value_str) or not EPOCH_RE.fullmatch(epoch_str):
         return None
-    if value < 0 or value > 9999.99 or sent_at < 0:
+    value = float(value_str)
+    if value > 9999.99:
         return None
-    if "." in value_str and len(value_str.split(".", 1)[1]) > 2:
-        return None
-    return {"sensor_id": sensor_id, "value_mm": value, "sent_at": sent_at}
+    return {"sensor_id": sensor_id, "value_mm": value, "sent_at": int(epoch_str)}
 
 
 def env(name: str, default: str | None = None, cast=str):
@@ -236,11 +236,16 @@ def flush_measurements(api: ApiClient, queue_path: Path) -> None:
     remaining: list[dict[str, Any]] = []
     sent = 0
     for entry in entries:
-        result = api.post_measurement(
-            entry.get("sensor_id", ""),
-            float(entry.get("value_mm", 0)),
-            int(entry.get("sent_at", 0)),
-        )
+        try:
+            value = float(entry.get("value_mm", 0))
+            sent_at = int(entry.get("sent_at", 0))
+        except (TypeError, ValueError):
+            value = math.nan
+        if not math.isfinite(value):
+            log.error("dropping invalid queued measurement: %s", entry)
+            continue
+
+        result = api.post_measurement(entry.get("sensor_id", ""), value, sent_at)
         if result.ok:
             sent += 1
         elif result.retryable:
