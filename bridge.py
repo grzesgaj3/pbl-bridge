@@ -42,15 +42,13 @@ class Config:
     http_timeout: float
 
 
+@dataclass(frozen=True)
 class ApiResult:
     """Outcome of an API call: ok flag + whether it is worth retrying."""
 
-    __slots__ = ("ok", "retryable", "detail")
-
-    def __init__(self, ok: bool, retryable: bool, detail: str = "") -> None:
-        self.ok = ok
-        self.retryable = retryable
-        self.detail = detail
+    ok: bool
+    retryable: bool = False
+    detail: str = ""
 
 
 class ApiClient:
@@ -60,6 +58,13 @@ class ApiClient:
         self.session.headers.update({"X-API-Key": api_key, "Content-Type": "application/json"})
         self.timeout = timeout
 
+    def _result(self, resp: requests.Response, ok_codes: tuple[int, ...]) -> ApiResult:
+        if resp.status_code in ok_codes:
+            return ApiResult(True)
+        if resp.status_code == 429 or resp.status_code >= 500:
+            return ApiResult(False, True, f"HTTP {resp.status_code}")
+        return ApiResult(False, False, f"HTTP {resp.status_code}: {resp.text[:200]}")
+
     def post_measurement(self, sensor_id: str, value_mm: float, sent_at: int) -> ApiResult:
         url = f"{self.base}/api/v1/measurements"
         body = {"sensor_id": sensor_id, "value_mm": value_mm, "sent_at": sent_at}
@@ -67,15 +72,8 @@ class ApiClient:
             resp = self.session.post(url, json=body, timeout=self.timeout)
         except requests.RequestException as exc:
             return ApiResult(False, True, str(exc))
-        if resp.status_code in (200, 201):
-            return ApiResult(True, False)
-        if resp.status_code == 409:
-            # Conflict: treat as handled so we don't poison the queue forever.
-            return ApiResult(True, False, "conflict")
-        if resp.status_code == 429 or resp.status_code >= 500:
-            return ApiResult(False, True, f"HTTP {resp.status_code}")
-        # Other 4xx -> permanent (bad data); drop from queue.
-        return ApiResult(False, False, f"HTTP {resp.status_code}: {resp.text[:200]}")
+        # 409 means the API already has this measurement.
+        return self._result(resp, (200, 201, 409))
 
     def get_pending_commands(self) -> list[dict[str, Any]]:
         url = f"{self.base}/api/v1/commands"
@@ -99,11 +97,7 @@ class ApiClient:
             resp = self.session.post(url, timeout=self.timeout)
         except requests.RequestException as exc:
             return ApiResult(False, True, str(exc))
-        if resp.status_code == 200 or resp.status_code == 409:
-            return ApiResult(True, False)
-        if resp.status_code == 429 or resp.status_code >= 500:
-            return ApiResult(False, True, f"HTTP {resp.status_code}")
-        return ApiResult(False, False, f"HTTP {resp.status_code}: {resp.text[:200]}")
+        return self._result(resp, (200, 409))
 
     def reject_command(self, command_id: int, note: str) -> None:
         url = f"{self.base}/api/v1/commands/{command_id}/reject"
