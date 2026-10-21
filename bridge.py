@@ -8,17 +8,18 @@ payload over the serial port.
 Configuration is read from environment variables (or a .env file).
 """
 
-from __future__ import annotations
-
 import contextlib
 import json
 import logging
+import math
 import os
+import re
 import signal
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import requests
@@ -28,29 +29,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 log = logging.getLogger("uart-bridge")
+storage_lock = threading.Lock()
+VALUE_RE = re.compile(r"\d+(?:\.\d{1,2})?")
+EPOCH_RE = re.compile(r"\d+")
 
 
 @dataclass(frozen=True)
-class Config:
-    api_url: str
-    api_key: str
-    serial_port: str
-    serial_baud: int
-    poll_interval: float
-    measurements_queue: Path
-    pending_acks: Path
-    http_timeout: float
-
-
 class ApiResult:
     """Outcome of an API call: ok flag + whether it is worth retrying."""
 
-    __slots__ = ("ok", "retryable", "detail")
-
-    def __init__(self, ok: bool, retryable: bool, detail: str = "") -> None:
-        self.ok = ok
-        self.retryable = retryable
-        self.detail = detail
+    ok: bool
+    retryable: bool = False
+    detail: str = ""
 
 
 class ApiClient:
@@ -60,6 +50,13 @@ class ApiClient:
         self.session.headers.update({"X-API-Key": api_key, "Content-Type": "application/json"})
         self.timeout = timeout
 
+    def _result(self, resp: requests.Response, ok_codes: tuple[int, ...]) -> ApiResult:
+        if resp.status_code in ok_codes:
+            return ApiResult(True)
+        if resp.status_code == 429 or resp.status_code >= 500:
+            return ApiResult(False, True, f"HTTP {resp.status_code}")
+        return ApiResult(False, False, f"HTTP {resp.status_code}: {resp.text[:200]}")
+
     def post_measurement(self, sensor_id: str, value_mm: float, sent_at: int) -> ApiResult:
         url = f"{self.base}/api/v1/measurements"
         body = {"sensor_id": sensor_id, "value_mm": value_mm, "sent_at": sent_at}
@@ -67,15 +64,8 @@ class ApiClient:
             resp = self.session.post(url, json=body, timeout=self.timeout)
         except requests.RequestException as exc:
             return ApiResult(False, True, str(exc))
-        if resp.status_code in (200, 201):
-            return ApiResult(True, False)
-        if resp.status_code == 409:
-            # Conflict: treat as handled so we don't poison the queue forever.
-            return ApiResult(True, False, "conflict")
-        if resp.status_code == 429 or resp.status_code >= 500:
-            return ApiResult(False, True, f"HTTP {resp.status_code}")
-        # Other 4xx -> permanent (bad data); drop from queue.
-        return ApiResult(False, False, f"HTTP {resp.status_code}: {resp.text[:200]}")
+        # 409 means the API already has this measurement.
+        return self._result(resp, (200, 201, 409))
 
     def get_pending_commands(self) -> list[dict[str, Any]]:
         url = f"{self.base}/api/v1/commands"
@@ -99,11 +89,7 @@ class ApiClient:
             resp = self.session.post(url, timeout=self.timeout)
         except requests.RequestException as exc:
             return ApiResult(False, True, str(exc))
-        if resp.status_code == 200 or resp.status_code == 409:
-            return ApiResult(True, False)
-        if resp.status_code == 429 or resp.status_code >= 500:
-            return ApiResult(False, True, f"HTTP {resp.status_code}")
-        return ApiResult(False, False, f"HTTP {resp.status_code}: {resp.text[:200]}")
+        return self._result(resp, (200, 409))
 
     def reject_command(self, command_id: int, note: str) -> None:
         url = f"{self.base}/api/v1/commands/{command_id}/reject"
@@ -113,153 +99,94 @@ class ApiClient:
             log.warning("reject command %s failed: %s", command_id, exc)
 
 
-class MeasurementQueue:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._lock = threading.Lock()
+def append_measurement(path: Path, entry: dict[str, Any]) -> None:
+    with storage_lock, path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
 
-    def append(self, entry: dict[str, Any]) -> None:
-        with self._lock, self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry) + "\n")
 
-    def load(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return self._read_unlocked()
-
-    def _read_unlocked(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
+def pop_measurements(path: Path) -> list[dict[str, Any]]:
+    """Read and truncate the queue."""
+    with storage_lock:
+        if not path.exists():
             return []
-        out: list[dict[str, Any]] = []
-        with self.path.open(encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(obj, dict):
-                    out.append(obj)
-        return out
+        lines = path.read_text(encoding="utf-8").splitlines()
+        path.write_text("", encoding="utf-8")
 
-    def pop_all(self) -> list[dict[str, Any]]:
-        """Atomically read and truncate the queue (used by the flush loop)."""
-        with self._lock:
-            entries = self._read_unlocked()
-            with self.path.open("w", encoding="utf-8"):
-                pass
-            return entries
-
-    def save(self, entries: list[dict[str, Any]]) -> None:
-        with self._lock:
-            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            with tmp.open("w", encoding="utf-8") as fh:
-                for entry in entries:
-                    fh.write(json.dumps(entry) + "\n")
-            tmp.replace(self.path)
+    entries: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
 
 
-class PendingAcks:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._lock = threading.Lock()
+def load_acks(path: Path) -> list[int]:
+    with storage_lock:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+    if not isinstance(data, list):
+        return []
+    return [int(x) for x in data if isinstance(x, int) or str(x).isdigit()]
 
-    def load(self) -> list[int]:
-        with self._lock:
-            if not self.path.exists():
-                return []
-            try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                return []
-            if not isinstance(data, list):
-                return []
-            return [int(x) for x in data if isinstance(x, int) or str(x).isdigit()]
 
-    def save(self, ids: list[int]) -> None:
-        with self._lock:
-            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_text(json.dumps(sorted(set(ids))), encoding="utf-8")
-            tmp.replace(self.path)
+def save_acks(path: Path, ids: list[int]) -> None:
+    with storage_lock:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(sorted(set(ids))), encoding="utf-8")
+        tmp.replace(path)
 
 
 def parse_measurement_line(line: str) -> dict[str, Any] | None:
-    """Parse 'sensor;value_mm;epoch'. Return None on any validation failure."""
-    parts = [p.strip() for p in line.strip().split(";")]
-    if len(parts) != 3:
+    """Parse 'sensor: value_mm;epoch[;]'. Return None on any validation failure."""
+    sensor_id, sep, rest = line.partition(":")
+    sensor_id = sensor_id.strip()
+    if not sep or not sensor_id or len(sensor_id) > 64:
         return None
-    sensor_id, value_str, epoch_str = parts
-    if not sensor_id or len(sensor_id) > 64:
+
+    parts = [p.strip() for p in rest.strip().rstrip(";").split(";")]
+    if len(parts) != 2:
         return None
-    try:
-        value = float(value_str)
-    except ValueError:
+    value_str, epoch_str = parts
+
+    if not VALUE_RE.fullmatch(value_str) or not EPOCH_RE.fullmatch(epoch_str):
         return None
-    if value < 0 or value > 9999.99:
+    value = float(value_str)
+    if value > 9999.99:
         return None
-    if "." in value_str:
-        decimals = value_str.split(".", 1)[1]
-        if len(decimals) > 2:
-            return None
-    try:
-        sent_at = int(epoch_str)
-    except ValueError:
-        return None
-    if sent_at < 0:
-        return None
-    return {"sensor_id": sensor_id, "value_mm": value, "sent_at": sent_at}
+    return {"sensor_id": sensor_id, "value_mm": value, "sent_at": int(epoch_str)}
 
 
-def load_config() -> Config:
-    def req(name: str) -> str:
-        value = os.getenv(name, "").strip()
-        if not value:
+def env(name: str, default: str | None = None, cast=str):
+    raw = os.getenv(name, default)
+    if raw is None or not raw.strip():
+        if default is None:
             raise SystemExit(f"Missing required environment variable: {name}")
-        return value
+        raw = default
+    try:
+        return cast(raw.strip())
+    except ValueError as exc:
+        raise SystemExit(f"Invalid {name}: {raw}") from exc
 
-    api_url = req("API_URL")
-    api_key = req("API_KEY")
-    serial_port = os.getenv("SERIAL_PORT", "/dev/serial0").strip()
-    baud_raw = os.getenv("SERIAL_BAUD", "9600").strip()
-    try:
-        serial_baud = int(baud_raw)
-    except ValueError as exc:
-        raise SystemExit(f"Invalid SERIAL_BAUD: {baud_raw}") from exc
-    interval_raw = os.getenv("POLL_INTERVAL_SEC", "30").strip()
-    try:
-        poll_interval = float(interval_raw)
-    except ValueError as exc:
-        raise SystemExit(f"Invalid POLL_INTERVAL_SEC: {interval_raw}") from exc
+
+def load_config() -> SimpleNamespace:
+    poll_interval = env("POLL_INTERVAL_SEC", "30", float)
     if poll_interval <= 0:
         raise SystemExit("POLL_INTERVAL_SEC must be > 0")
-    measurements_queue = Path(
-        os.getenv("MEASUREMENTS_QUEUE_FILE", "measurements_queue.jsonl").strip()
-    )
-    pending_acks = Path(os.getenv("PENDING_ACKS_FILE", "pending_acks.json").strip())
-    http_timeout_raw = os.getenv("HTTP_TIMEOUT_SEC", "10").strip()
-    try:
-        http_timeout = float(http_timeout_raw)
-    except ValueError as exc:
-        raise SystemExit(f"Invalid HTTP_TIMEOUT_SEC: {http_timeout_raw}") from exc
 
-    return Config(
-        api_url=api_url,
-        api_key=api_key,
-        serial_port=serial_port,
-        serial_baud=serial_baud,
+    return SimpleNamespace(
+        api_url=env("API_URL"),
+        api_key=env("API_KEY"),
+        serial_port=env("SERIAL_PORT", "/dev/serial0"),
+        serial_baud=env("SERIAL_BAUD", "9600", int),
         poll_interval=poll_interval,
-        measurements_queue=measurements_queue,
-        pending_acks=pending_acks,
-        http_timeout=http_timeout,
-    )
-
-
-def setup_logging(level_name: str) -> None:
-    level = getattr(logging, level_name.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        measurements_queue=Path(env("MEASUREMENTS_QUEUE_FILE", "measurements_queue.jsonl")),
+        pending_acks=Path(env("PENDING_ACKS_FILE", "pending_acks.json")),
+        http_timeout=env("HTTP_TIMEOUT_SEC", "10", float),
     )
 
 
@@ -267,7 +194,7 @@ def uart_reader(
     ser: serial.Serial,
     serial_lock: threading.Lock,
     api: ApiClient,
-    queue: MeasurementQueue,
+    queue_path: Path,
     stop_event: threading.Event,
 ) -> None:
     while not stop_event.is_set():
@@ -278,18 +205,15 @@ def uart_reader(
             log.error("serial read error: %s", exc)
             time.sleep(2)
             continue
-        if not raw:
-            continue
-        try:
-            line = raw.decode("utf-8", errors="replace").strip()
-        except UnicodeDecodeError:
-            continue
+
+        line = raw.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         entry = parse_measurement_line(line)
         if entry is None:
             log.warning("invalid measurement line ignored: %r", line)
             continue
+
         result = api.post_measurement(entry["sensor_id"], entry["value_mm"], entry["sent_at"])
         if result.ok:
             log.info(
@@ -298,64 +222,66 @@ def uart_reader(
                 entry["value_mm"],
                 entry["sent_at"],
             )
-            continue
-        if result.retryable:
+        elif result.retryable:
             log.warning("API unavailable, queued: %s (%s)", entry, result.detail)
-            queue.append(entry)
+            append_measurement(queue_path, entry)
         else:
             log.error("measurement rejected by API, dropped: %s (%s)", entry, result.detail)
 
 
-def flush_measurements(api: ApiClient, queue: MeasurementQueue) -> None:
-    entries = queue.pop_all()
+def flush_measurements(api: ApiClient, queue_path: Path) -> None:
+    entries = pop_measurements(queue_path)
     if not entries:
         return
     remaining: list[dict[str, Any]] = []
     sent = 0
     for entry in entries:
-        result = api.post_measurement(
-            entry.get("sensor_id", ""),
-            float(entry.get("value_mm", 0)),
-            int(entry.get("sent_at", 0)),
-        )
+        try:
+            value = float(entry.get("value_mm", 0))
+            sent_at = int(entry.get("sent_at", 0))
+        except (TypeError, ValueError):
+            value = math.nan
+        if not math.isfinite(value):
+            log.error("dropping invalid queued measurement: %s", entry)
+            continue
+
+        result = api.post_measurement(entry.get("sensor_id", ""), value, sent_at)
         if result.ok:
             sent += 1
-            continue
-        if result.retryable:
+        elif result.retryable:
             remaining.append(entry)
         else:
             log.error("dropping queued measurement (permanent): %s (%s)", entry, result.detail)
     for entry in remaining:
-        queue.append(entry)
+        append_measurement(queue_path, entry)
     if sent:
         log.info("flushed %d queued measurement(s); %d remain", sent, len(remaining))
 
 
-def flush_pending_acks(api: ApiClient, pending: PendingAcks) -> None:
-    ids = pending.load()
+def flush_pending_acks(api: ApiClient, acks_path: Path) -> None:
+    ids = load_acks(acks_path)
     if not ids:
         return
-    remaining: list[int] = []
+    remaining = []
     for cid in ids:
         result = api.ack_command(cid)
-        if not result.ok and result.retryable:
+        if result.ok:
+            continue
+        if result.retryable:
             remaining.append(cid)
-        elif not result.ok:
+        else:
             log.error("dropping pending ack %s (%s)", cid, result.detail)
     if remaining != ids:
-        pending.save(remaining)
+        save_acks(acks_path, remaining)
 
 
 def process_commands(
     api: ApiClient,
     ser: serial.Serial,
     serial_lock: threading.Lock,
-    pending: PendingAcks,
+    acks_path: Path,
 ) -> None:
-    commands = api.get_pending_commands()
-    if not commands:
-        return
-    for cmd in commands:
+    for cmd in api.get_pending_commands():
         cid = cmd.get("id")
         if not isinstance(cid, int):
             continue
@@ -377,21 +303,22 @@ def process_commands(
             log.info("command %s acknowledged (payload=%r)", cid, payload)
         elif result.retryable:
             log.warning("ack failed for command %s, queued", cid)
-            ids = pending.load()
+            ids = load_acks(acks_path)
             ids.append(cid)
-            pending.save(ids)
+            save_acks(acks_path, ids)
         else:
             log.error("ack rejected for command %s: %s", cid, result.detail)
 
 
 def main() -> None:
     config = load_config()
-    setup_logging(os.getenv("LOG_LEVEL", "info"))
+    logging.basicConfig(
+        level=getattr(logging, os.getenv("LOG_LEVEL", "info").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     log.info(
         "starting uart-bridge: port=%s baud=%s interval=%ss",
-        config.serial_port,
-        config.serial_baud,
-        config.poll_interval,
+        config.serial_port, config.serial_baud, config.poll_interval,
     )
 
     try:
@@ -401,8 +328,6 @@ def main() -> None:
         raise SystemExit(1) from exc
 
     serial_lock = threading.Lock()
-    queue = MeasurementQueue(config.measurements_queue)
-    pending = PendingAcks(config.pending_acks)
     api = ApiClient(config.api_url, config.api_key, config.http_timeout)
 
     stop_event = threading.Event()
@@ -415,18 +340,16 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
 
     reader = threading.Thread(
-        target=uart_reader,
-        args=(ser, serial_lock, api, queue, stop_event),
-        name="uart-reader",
-        daemon=True,
+        target=uart_reader, args=(ser, serial_lock, api, config.measurements_queue, stop_event),
+        name="uart-reader", daemon=True,
     )
     reader.start()
 
     try:
         while not stop_event.is_set():
-            flush_measurements(api, queue)
-            flush_pending_acks(api, pending)
-            process_commands(api, ser, serial_lock, pending)
+            flush_measurements(api, config.measurements_queue)
+            flush_pending_acks(api, config.pending_acks)
+            process_commands(api, ser, serial_lock, config.pending_acks)
             stop_event.wait(config.poll_interval)
     finally:
         stop_event.set()
